@@ -371,6 +371,7 @@ namespace Proc {
 	extern int scroll_pos;
 	extern string selected_name;
 	extern atomic<bool> resized;
+	extern bool has_gpu_stats;
 
 	//? Contains the valid sorting options for processes
 	extern const vector<string> sort_vector;
@@ -390,6 +391,8 @@ namespace Proc {
 		uint64_t mem{};
 		double cpu_p{};         // defaults to = 0.0
 		double cpu_c{};         // defaults to = 0.0
+		double gpu_p{};
+		uint64_t gpu_m{};
 		char state = '0';
 		int64_t p_nice{};
 		uint64_t ppid{};

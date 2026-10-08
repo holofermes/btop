@@ -1910,15 +1910,19 @@ namespace Gpu {
 
 	namespace Intel {
 		//? GPU memory is the resident memory of the GPU's DRM clients, see https://docs.kernel.org/gpu/drm-usage-stats.html
-		struct drm_client { size_t pid; string fd; long long resident; };
+		using engine_classes = std::unordered_map<string, double>;
+		struct drm_client { vector<size_t> pids; string fd; long long resident; engine_classes busy, usage; uint64_t read_at; };
 		std::unordered_map<uint64_t, drm_client> clients;
+		std::unordered_map<size_t, pair<double, uint64_t>> proc_stats; //? Usage and memory by pid
+		uint64_t proc_stats_time = 0;
 		string pdev;
 		int dri_watch = -1;
 		unsigned int updates_since_scan = 0;
 
-		static pair<uint64_t, long long> read_fdinfo(const fs::path& path) {
+		static pair<uint64_t, long long> read_fdinfo(const fs::path& path, engine_classes& busy) {
 			uint64_t id = 0;
 			long long resident = -1;
+			std::unordered_map<string, long long> capacity;
 			ifstream file(path);
 			for (string line; getline(file, line);) {
 				const auto colon = line.find(':');
@@ -1931,12 +1935,38 @@ namespace Gpu {
 				if (key == "drm-client-id") id = num;
 				else if (key.starts_with("drm-resident-"))
 					resident = max(resident, 0ll) + (value.ends_with("MiB") ? num << 20 : value.ends_with("KiB") ? num << 10 : num);
+				else if (key.starts_with("drm-engine-capacity-")) capacity[string{key.substr(20)}] = num;
+				else if (key.starts_with("drm-engine-")) busy[string{key.substr(11)}] = num;
 			}
+			for (auto& [name, ns] : busy) ns /= max(capacity[name], 1ll);
 			return {resident < 0 ? 0 : id, resident};
 		}
 
+		//? Sets the resident bytes and the busy percent per engine class since the last read, keeping the larger busy time
+		static void update(drm_client& client, long long resident, const engine_classes& busy) {
+			const auto last_read = std::exchange(client.read_at, uptime_micros());
+			client.resident = resident;
+			for (const auto& [name, ns] : busy) {
+				auto& last = client.busy[name];
+				if (last_read > 0) client.usage[name] = clamp((ns - last) / (double)(client.read_at - last_read) / 10.0, 0.0, 100.0);
+				last = max(last, ns);
+			}
+		}
+
+		//? A process holding several clients shows the busiest engine class of their summed usage
+		static void collect_proc_stats() {
+			std::unordered_map<size_t, engine_classes> usage;
+			proc_stats.clear();
+			for (const auto& [id, client] : clients)
+				for (const size_t pid : client.pids) {
+					proc_stats[pid].second += client.resident;
+					for (const auto& [name, percent] : client.usage) usage[pid][name] += percent;
+				}
+			for (const auto& [pid, classes] : usage) proc_stats[pid].first = min(rng::max(classes | rng::views::values), 100.0);
+		}
+
 		static void scan() {
-			clients.clear();
+			for (auto& client : clients) client.second.pids.clear();
 			updates_since_scan = 0;
 			std::error_code ec;
 			constexpr string_view dri = "/dev/dri/";
@@ -1947,10 +1977,20 @@ namespace Gpu {
 					char link[dri.size()] {};
 					if (readlink(fd->path().c_str(), link, sizeof link) == -1 and errno == EACCES) break;
 					if (string_view{link, sizeof link} != dri) continue;
-					const auto [id, resident] = read_fdinfo(proc->path() / "fdinfo" / fd->path().filename());
-					if (id != 0) clients[id] = {stoul(pid), fd->path().filename(), resident};
+					engine_classes busy;
+					const auto [id, resident] = read_fdinfo(proc->path() / "fdinfo" / fd->path().filename(), busy);
+					if (id == 0) continue;
+					//? A client held by several processes counts in each of them, it is read through the first one found
+					auto& client = clients[id];
+					if (client.pids.empty()) {
+						client.fd = fd->path().filename();
+						update(client, resident, busy);
+					}
+					if (not v_contains(client.pids, stoul(pid))) client.pids.push_back(stoul(pid));
 				}
 			}
+			std::erase_if(clients, [](const auto& client) { return client.second.pids.empty(); });
+			collect_proc_stats();
 		}
 
 		static long long collect_mem() {
@@ -1960,12 +2000,14 @@ namespace Gpu {
 				scan();
 			else if (updates_since_scan % 5 == 0) {
 				std::erase_if(clients, [](auto& client) {
-					auto& [pid, fd, resident] = client.second;
-					const auto [id, size] = read_fdinfo(Shared::procPath / std::to_string(pid) / "fdinfo" / fd);
-					resident = size;
+					engine_classes busy;
+					const auto [id, size] = read_fdinfo(Shared::procPath / std::to_string(client.second.pids[0]) / "fdinfo" / client.second.fd, busy);
+					update(client.second, size, busy);
 					return id != client.first;
 				});
+				collect_proc_stats();
 			}
+			proc_stats_time = uptime_micros();
 			return std::accumulate(clients.begin(), clients.end(), 0ll, [](long long sum, const auto& client) { return sum + client.second.resident; });
 		}
 
@@ -3321,6 +3363,10 @@ namespace Proc {
 		else {
 			should_filter = true;
 			found.clear();
+		#if defined(GPU_SUPPORT)
+			const bool gpu_stats = not Gpu::Intel::proc_stats.empty() and uptime_micros() - Gpu::Intel::proc_stats_time < 2'000ull * Config::getI("update_ms");
+			if (gpu_stats != std::exchange(has_gpu_stats, gpu_stats)) redraw = true;
+		#endif
 
 			//? First make sure kernel proc cache is cleared.
 			if (should_filter_kernel and ++proc_clear_count >= 256) {
@@ -3400,6 +3446,10 @@ namespace Proc {
 				else if (dead_procs.contains(pid)) continue;
 
 				auto& new_proc = *find_old;
+			#if defined(GPU_SUPPORT)
+				const auto gpu = Gpu::Intel::proc_stats.find(pid);
+				std::tie(new_proc.gpu_p, new_proc.gpu_m) = has_gpu_stats and gpu != Gpu::Intel::proc_stats.end() ? gpu->second : pair<double, uint64_t>{};
+			#endif
 
 				//? Get program name, command and username
 				if (no_cache) {

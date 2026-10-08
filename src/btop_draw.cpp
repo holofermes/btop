@@ -1607,6 +1607,7 @@ namespace Proc {
 	int start, selected, select_max;
 	bool shown = true, redraw = true;
 	bool is_last_process_in_list = false;
+	bool has_gpu_stats = false;
 	int selected_pid = 0, selected_depth = 0;
 	int scroll_pos;
 	string selected_name;
@@ -1617,7 +1618,7 @@ namespace Proc {
 	Draw::TextEdit filter;
 	Draw::Graph detailed_cpu_graph;
 	Draw::Graph detailed_mem_graph;
-	int user_size, thread_size, prog_size, cmd_size, tree_size;
+	int user_size, thread_size, prog_size, cmd_size, tree_size, gpu_size;
 	int dgraph_x, dgraph_width, d_width, d_x, d_y;
 	bool previous_proc_banner_state = false;
 	atomic<bool> resized (false);
@@ -1813,6 +1814,10 @@ namespace Proc {
 				cmd_size += 5;
 				tree_size += 5;
 			}
+			//? GPU columns if the command column keeps at least 12 characters
+			gpu_size = (has_gpu_stats and cmd_size >= 24 ? 12 : 0);
+			cmd_size -= gpu_size;
+			tree_size -= gpu_size;
 
 			//? Detailed box
 			if (show_detailed) {
@@ -1992,7 +1997,7 @@ namespace Proc {
 			out += (thread_size > 0 ? Mv::l(4) + "Threads: " : "")
 					+ ljust("User:", user_size) + ' '
 					+ rjust((mem_bytes ? "MemB" : "Mem%"), 5) + ' '
-					+ rjust("Cpu%", (show_graphs ? 10 : 5)) + Fx::ub;
+					+ rjust("Cpu%", (show_graphs ? 10 : 5)) + (gpu_size > 0 ? "  GMem  Gpu%" : "") + Fx::ub;
 		}
 		//* End of redraw block
 
@@ -2167,7 +2172,9 @@ namespace Proc {
 				+ m_color + rjust(mem_str, 5) + end + ' '
 				+ (is_selected or is_followed ? "" : Theme::c("inactive_fg")) + (show_graphs ? graph_bg * 5: "")
 				+ (p_graphs.contains(p.pid) ? Mv::l(5) + c_color + p_graphs.at(p.pid)({(p.cpu_p >= 0.1 and p.cpu_p < 5 ? 5ll : (long long)round(p.cpu_p))}, data_same) : "") + end + ' '
-				+ c_color + rjust(cpu_str, 4) + "  " + end;
+				+ c_color + rjust(cpu_str, 4) + end
+				+ (gpu_size > 0 ? g_color + ' ' + rjust(p.gpu_m > 0 ? floating_humanizer(p.gpu_m, true) : "-", 5)
+					+ ' ' + rjust(p.gpu_p > 0 or p.gpu_m > 0 ? fmt::format("{:.1f}", p.gpu_p) : "-", 5) : "") + "  " + end;
 			if (lc++ > height - 5) break;
 			else if (lc > height - 5 and proc_banner_shown) break;
 		}
